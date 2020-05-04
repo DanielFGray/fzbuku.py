@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+
+import sqlite3
+import subprocess
+import sys
+import requests
+import errno
+import re
+import os
+import atexit
+
+from bs4 import BeautifulSoup
+
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style
+
+# from prompt_toolkit.layout.containers import VSplit, Window
+# from prompt_toolkit.buffer import Buffer
+# from prompt_toolkit.formatted_text import to_formatted_text, HTML
+# from prompt_toolkit import print_formatted_text as print
+# from prompt_toolkit.auto_suggest import DynamicAutoSuggest
+
+
+prompt_style = Style.from_dict({
+    'err': 'ansired',
+    'danger': 'ansired',
+    'norm': 'gray',
+})
+
+
+def colorize(c, s):
+    return f'\033[{c}m{s}\033[0m' # FIXME stop hard-coding escape codes
+
+def red(s):
+    return colorize('31', s)
+
+def gray(s):
+    return colorize('90', s)
+
+# def htmlformat(str): TODO
+#     return to_formatted_text(HTML(str), style=prompt_style)
+
+def start_alternate_terminal_buffer():
+    sys.stdout.write("\033[?1049h\033[H")
+
+def exit_alternate_terminal_buffer():
+    sys.stdout.write("\033[?1049l")
+
+def print_error(s):
+    sys.stdrr.write(f"{red(s)}\n")
+
+def cmd(name, args, stdinput): # which wheel did i reinvent
+    proc = subprocess.Popen(
+        [name, *args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=None
+    )
+    stdin = proc.stdin
+
+    for line in stdinput:
+        try:
+            stdin.write(line.encode() + b'\n')
+            stdin.flush()
+        except IOError as e:
+            if e.errno != errno.EPIPE:
+                raise
+            break
+
+    try:
+        stdin.close()
+    except IOError as e:
+        if e.errno != errno.EPIPE:
+            raise
+
+    stdout = proc.stdout
+    return [l.strip(b'\n').decode() for l in iter(stdout.readline, b'')]
+
+
+def fzf(args, input):
+    return cmd('fzf', ['--height=100%', '--no-clear', *args], input)
+
+
+def import_firefox_bookmarks():
+    # FIXME this is unused, needs more fzf to list+pick profile
+    ff = sqlite3.connect(f'${home}/.mozilla/firefox/${profile}/places.sqlite')
+    ff.row_factory = sqlite3.Row
+    ffc = ff.cursor()
+    query = """
+        select moz_bookmarks.title, moz_places.url from moz_bookmarks
+        left join moz_places ON fk=moz_places.id
+        """
+    result = ffc.execute(query).fetchall()
+
+
+class Bookmarks:
+    def __init__(self):
+        self.db = sqlite3.connect('/home/dan/.local/share/buku/bookmarks.db')
+        self.db.row_factory = sqlite3.Row
+        self.dbc = self.db.cursor()
+
+        if sys.stdout.isatty():
+            # TODO make sure fzf is available?
+            # or ideally replace it all with more prompt_toolkit
+
+            start_alternate_terminal_buffer()
+            return self.pick_bookmarks()
+
+        # we dmenu now
+        # but it's broken?
+        pretty = ['{id} {metadata}'.format(**l) for l in self.bookmarklist]
+        out = cmd('dmenu', [
+            '-l', '10',
+            '-nb', '#131313',
+            '-fn', 'Cascadia Code-7',
+        ], pretty)
+        id, *title = out[0].split(' ')
+        matched = next(x for x in self.bookmarklist if x['id'] == int(id))
+        self.open_url(matched['URL'])
+
+
+    def query(self, *args):
+        res = self.dbc.execute(*args)
+        self.db.commit()
+        return res
+
+    def query_all(self, *args):
+        return [dict(zip(r.keys(), r)) for r in self.dbc.execute(*args).fetchall()]
+
+    def query_one(self, *args):
+        # FIXME this seems wrong
+        return [dict(zip(r.keys(), r)) for r in self.dbc.execute(*args)]
+
+    def get_bookmarks(self):
+        return self.query('select * from bookmarks order by id desc')
+
+    def title_from_url(self, url):
+        return BeautifulSoup(requests.get(url, timeout=(2, 1)).text, features='lxml').title.string
+
+    def pick_tags(self, prompt_title, *, default=""):
+        all_tags = self.query_all('select tags from bookmarks')
+        tag_list = set() # TODO set comprehension?
+        for ts in all_tags:
+            for t in filter(len, ts['tags'].split(',')):
+                tag_list.add(t)
+        text = prompt(
+            [('class:gray', f'{prompt_title} ')],
+            style=prompt_style,
+            default=default,
+            completer=WordCompleter(tag_list, ignore_case=True),
+        )
+        return ",{0},".format(','.join(re.split(', \*', text)))
+
+
+    def create(self, *, url="", description="", tags="", title="", force_prompt=False):
+        try:
+            if not url or force_prompt == True:
+                    url = prompt([('class:norm', 'Enter url: ')], style=prompt_style, default=url)
+
+            if not url:
+                return
+
+            existing = self.query_one('select id from bookmarks where url=?', [url])
+            if existing:
+                raise Exception('url already exists!')
+
+            if not title or force_prompt == True:
+                try:
+                    default_title = self.title_from_url(url)
+                    # TODO show auto_suggest when empty?
+                    title = prompt([('class:norm', 'Enter title: ')], style=prompt_style, default=default_title)
+                except requests.exceptions.InvalidURL:
+                    print_error("invalid url")
+                    return self.create(url=url, force_prompt=True)
+                except requests.exceptions.InvalidSchema:
+                    print_error("invalid url")
+                    return self.create(url=url, force_prompt=True)
+                except requests.exceptions.MissingSchema:
+                    print_error("invalid url")
+                    return self.create(url=url, force_prompt=True)
+                except requests.exceptions.ConnectionError:
+                    print_error("failed to connect to url, probably doesn't exist")
+                    return self.create(url=url, force_prompt=True)
+
+            if not tags or force_prompt == True:
+                tags = self.pick_tags('Enter tags:')
+
+            # TODO confirm data?
+
+            self.query('insert into bookmarks (URL, metadata, desc, tags) values (?, ?, ?, ?)', [url, title, description, tags])
+        except KeyboardInterrupt:
+            return
+
+
+    def edit_by_id(self, id, *, url="", description="", tags="", title=""):
+        # FIXME this is a lot of copypasta from create
+        [bm] = self.query_one('select * from bookmarks where id=?', [id])
+        pretty = '\n'.join(f'{key}: {value !r}' for key, value in bm.items())
+        out = fzf([], [
+            f"{gray('title:')} {bm['metadata']}",
+            f"{gray('url:')} {bm['URL']}",
+            f"{gray('tags:')} {bm['tags'].strip(',')}",
+            f"{gray('description:')} {bm['desc'].replace(chr(10), ' ')}",
+            f"{red('delete')}",
+        ])
+
+        if not out:
+            self.db.commit()
+            return
+        [field, *_] = out[0].split(':')
+
+        try:
+            if field == 'url':
+                os.system('clear')
+                new_url = prompt([('class:norm', 'Enter url: ')], style=prompt_style, default=bm['URL'])
+                self.query('update bookmarks set URL=? where id=?', [new_url.strip(), id])
+                return self.edit_by_id(id)
+
+            elif field == 'title':
+                os.system('clear')
+                new_title = prompt([('class:norm', 'Enter title: ')], style=prompt_style, default=bm['metadata'])
+                self.query('update bookmarks set metadata=? where id=?', [new_title.strip(), id])
+                return self.edit_by_id(id)
+
+            elif field == 'description':
+                os.system('clear')
+                print('Enter description: ')
+                new_desc = prompt('', default=bm['desc'], multiline=True)
+                self.query('update bookmarks set desc=? where id=?', [new_desc.strip(), id])
+                return self.edit_by_id(id)
+
+            elif field == 'delete':
+                self.delete_by_id(id)
+
+            elif field == 'tags':
+                os.system('clear')
+                tags = self.pick_tags('Enter tags:', default=bm['tags'].strip(','))
+
+                self.query('update bookmarks set tags=? where id=?', [tags, id])
+                return self.edit_by_id(id)
+        except KeyboardInterrupt:
+            return self.edit_by_id(id)
+
+
+    def delete_by_id(self, id):
+        [bm] = self.query_one('select URL as url, metadata as title, tags from bookmarks where id=?', [id])
+        print (bm)
+        try:
+            confirm = prompt([('class:danger', 'type yes to delete: ')], style=prompt_style)
+        except KeyboardInterrupt:
+            return
+
+        if confirm == '' or confirm == 'y' or confirm == 'ye':
+            print_error('please type yes to delete')
+            return self.delete_by_id(id)
+        elif confirm == 'yes':
+            self.query('delete from bookmarks where id=?', [id])
+            self.db.commit()
+
+
+    def pick_bookmarks(self):
+        pretty = [f"{l['id']} {l['URL']} {gray(l['tags'].strip(','))} {l['metadata']}" for l in self.get_bookmarks()]
+        pick = fzf([
+            '--preview={ readability {2} 2> /dev/null || curl -s {2} } | w3m -T text/html',
+            '--with-nth=3..',
+            '--expect=ctrl-d,ctrl-e,insert,esc',
+            '--bind=enter:execute:myurls {2}',
+            '--header=ctrl-e to edit, ctrl-d to delete, insert to create',
+        ], pretty)
+        if not pick:
+            return
+        key, *matches = pick
+        id, url, *title = matches[0].split(' ')
+        if key == 'enter':
+            self.open_url(url)
+        elif key == 'ctrl-d':
+            self.delete_by_id(id)
+        elif key == 'ctrl-e':
+            self.edit_by_id(id)
+        elif key == 'insert':
+            os.system('clear')
+            self.create()
+        else:
+            return
+        return self.pick_bookmarks()
+
+def cleanup():
+    # exit alternate screen
+    sys.stdout.write("\033[?1049l") # FIXME stop embedding escape codes
+
+atexit.register(cleanup)
+
+if __name__ == '__main__':
+    # FIXME what about cli args??
+    Bookmarks()
