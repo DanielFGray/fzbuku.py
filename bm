@@ -38,6 +38,8 @@ def red(s):
 
 def gray(s):
     return colorize('90', s)
+data_dir = os.getenv('XDG_DATA_HOME', default=os.path.join(os.getenv('HOME'), '.local', 'share'))
+db_file = f'{data_dir}/buku/bookmarks.db'
 
 # def htmlformat(str): TODO
 #     return to_formatted_text(HTML(str), style=prompt_style)
@@ -85,7 +87,7 @@ def fzf(args, input):
 
 def import_firefox_bookmarks():
     # FIXME this is unused, needs more fzf to list+pick profile
-    ff = sqlite3.connect(f'${home}/.mozilla/firefox/${profile}/places.sqlite')
+    ff = sqlite3.connect(f'{os.getenv('HOME')}/.mozilla/firefox/{profile}/places.sqlite')
     ff.row_factory = sqlite3.Row
     ffc = ff.cursor()
     query = """
@@ -97,7 +99,7 @@ def import_firefox_bookmarks():
 
 class Bookmarks:
     def __init__(self):
-        self.db = sqlite3.connect('/home/dan/.local/share/buku/bookmarks.db')
+        self.db = sqlite3.connect(db_file)
         self.db.row_factory = sqlite3.Row
         self.dbc = self.db.cursor()
 
